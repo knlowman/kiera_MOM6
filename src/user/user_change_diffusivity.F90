@@ -30,6 +30,8 @@ type, public :: user_change_diff_CS ; private
                         !! any filtering or scaling [H Z T-1 ~> m2 s-1 or kg m-1 s-1]
   real :: lat_range(4)  !< 4 values that define the latitude range over which
                         !! a diffusivity scaled by Kd_add is added [degrees_N].
+  real :: lon_range(4)  !< 4 values that define the longitude range over which
+                        !! a diffusivity scaled by Kd_add is added [degrees_E].
   real :: rho_range(4)  !< 4 values that define the coordinate potential
                         !! density range over which a diffusivity scaled by
                         !! Kd_add is added [R ~> kg m-3].
@@ -70,6 +72,7 @@ subroutine user_change_diff(h, tv, G, GV, US, CS, Kd_lay, Kd_int, T_f, S_f, Kd_i
   real :: p_ref(SZI_(G))       ! An array of tv%P_Ref pressures [R L2 T-2 ~> Pa].
   real :: rho_fn      ! The density dependence of the input function, 0-1 [nondim].
   real :: lat_fn      ! The latitude dependence of the input function, 0-1 [nondim].
+  real :: lon_fn      ! The longitude dependence of the input function, 0-1 [nondim].
   logical :: use_EOS  ! If true, density is calculated from T & S using an
                       ! equation of state.
   logical :: store_Kd_add  ! Save the added diffusivity as a diagnostic if true.
@@ -96,6 +99,11 @@ subroutine user_change_diff(h, tv, G, GV, US, CS, Kd_lay, Kd_int, T_f, S_f, Kd_i
   if (.not.range_OK(CS%lat_range)) then
     write(mesg, '(4(1pe15.6))') CS%lat_range(1:4)
     call MOM_error(FATAL, "user_set_diffusivity: bad latitude range: \n  "//&
+                    trim(mesg))
+  endif
+  if (.not.range_OK(CS%lon_range)) then
+    write(mesg, '(4(1pe15.6))') CS%lon_range(1:4)
+    call MOM_error(FATAL, "user_set_diffusivity: bad longitude range: \n  "//&
                     trim(mesg))
   endif
   if (.not.range_OK(CS%rho_range)) then
@@ -126,9 +134,10 @@ subroutine user_change_diff(h, tv, G, GV, US, CS, Kd_lay, Kd_int, T_f, S_f, Kd_i
         else
           lat_fn = val_weights(G%geoLatT(i,j), CS%lat_range)
         endif
+        lon_fn = val_weights(G%geoLonT(i,j), CS%lon_range)
         rho_fn = val_weights(Rcv(i,k), CS%rho_range)
-        if (rho_fn * lat_fn > 0.0) &
-          Kd_lay(i,j,k) = Kd_lay(i,j,k) + CS%Kd_add * rho_fn * lat_fn
+        if (rho_fn * lat_fn * lon_fn > 0.0) &
+          Kd_lay(i,j,k) = Kd_lay(i,j,k) + CS%Kd_add * rho_fn * lat_fn * lon_fn
       enddo ; enddo
     endif
     if (present(Kd_int)) then
@@ -138,10 +147,11 @@ subroutine user_change_diff(h, tv, G, GV, US, CS, Kd_lay, Kd_int, T_f, S_f, Kd_i
         else
           lat_fn = val_weights(G%geoLatT(i,j), CS%lat_range)
         endif
+        lon_fn = val_weights(G%geoLonT(i,j), CS%lon_range)
         rho_fn = val_weights( 0.5*(Rcv(i,k-1) + Rcv(i,k)), CS%rho_range)
-        if (rho_fn * lat_fn > 0.0) then
-          Kd_int(i,j,K) = Kd_int(i,j,K) + CS%Kd_add * rho_fn * lat_fn
-          if (store_Kd_add) Kd_int_add(i,j,K) = CS%Kd_add * rho_fn * lat_fn
+        if (rho_fn * lat_fn * lon_fn > 0.0) then
+          Kd_int(i,j,K) = Kd_int(i,j,K) + CS%Kd_add * rho_fn * lat_fn * lon_fn
+          if (store_Kd_add) Kd_int_add(i,j,K) = CS%Kd_add * rho_fn * lat_fn * lon_fn
         endif
       enddo ; enddo
     endif
@@ -231,6 +241,13 @@ subroutine user_change_diff_init(Time, G, GV, US, param_file, diag, CS)
                  "which the extra diffusivity starts to increase from 0, "//&
                  "hits its full value, starts to decrease again, and is "//&
                  "back to 0.", units="degrees_N", defaults=(/-1.0e9,-1.0e9,-1.0e9,-1.0e9/))
+    call get_param(param_file, mdl, "USER_KD_ADD_LON_RANGE", CS%lon_range(:), &
+                 "Four successive values that define a range of longitudes "//&
+                 "over which the user-specified extra diffusivity is "//&
+                 "applied.  The four values specify the longitudes at "//&
+                 "which the extra diffusivity starts to increase from 0, "//&
+                 "hits its full value, starts to decrease again, and is "//&
+                 "back to 0.", units="degrees_E", defaults=(/-1.0e9,-1.0e9,-1.0e9,-1.0e9/))
     call get_param(param_file, mdl, "USER_KD_ADD_RHO_RANGE", CS%rho_range(:), &
                  "Four successive values that define a range of potential "//&
                  "densities over which the user-given extra diffusivity "//&
@@ -248,6 +265,11 @@ subroutine user_change_diff_init(Time, G, GV, US, param_file, diag, CS)
   if (.not.range_OK(CS%lat_range)) then
     write(mesg, '(4(1pe15.6))') CS%lat_range(1:4)
     call MOM_error(FATAL, "user_set_diffusivity: bad latitude range: \n  "//&
+                    trim(mesg))
+  endif
+  if (.not.range_OK(CS%lon_range)) then
+    write(mesg, '(4(1pe15.6))') CS%lon_range(1:4)
+    call MOM_error(FATAL, "user_set_diffusivity: bad longitude range: \n  "//&
                     trim(mesg))
   endif
   if (.not.range_OK(CS%rho_range)) then
