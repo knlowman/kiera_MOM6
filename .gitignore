@@ -21,3 +21,6 @@ config.status
 configure
 /Makefile
 Makefile.mkmf
+
+# Ignore Mac-specific files
+.DS_Store
