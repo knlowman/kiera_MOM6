@@ -1,6 +1,6 @@
 !> Calculate vertical diffusivity from all mixing processes
 module MOM_set_diffusivity
-
+!> This is the edited version of the 2020 module.
 ! This file is part of MOM6. See LICENSE.md for the license.
 
 use MOM_bkgnd_mixing,        only : calculate_bkgnd_mixing, bkgnd_mixing_init, bkgnd_mixing_cs
@@ -15,13 +15,14 @@ use MOM_diag_mediator,       only : diag_ctrl, time_type
 use MOM_diag_mediator,       only : post_data, register_diag_field
 use MOM_debugging,           only : hchksum, uvchksum, Bchksum, hchksum_pair
 use MOM_EOS,                 only : calculate_density, calculate_density_derivs, EOS_domain
-use MOM_error_handler,       only : MOM_error, is_root_pe, FATAL, WARNING, NOTE
+use MOM_error_handler,       only : MOM_error, MOM_mesg, is_root_pe, FATAL, WARNING, NOTE
 use MOM_error_handler,       only : callTree_showQuery
 use MOM_error_handler,       only : callTree_enter, callTree_leave, callTree_waypoint
 use MOM_file_parser,         only : get_param, log_param, log_version, param_file_type
 use MOM_forcing_type,        only : forcing, optics_type
 use MOM_full_convection,     only : full_convection
 use MOM_grid,                only : ocean_grid_type
+!use MOM_interface_heights,   only : thickness_to_dz, find_rho_bottom ! added Sept 24 b/c I noticed it was missing
 use MOM_internal_tides,      only : int_tide_CS, get_lowmode_loss
 use MOM_intrinsic_functions, only : invcosh
 use MOM_io,                  only : slasher, MOM_read_data
@@ -165,7 +166,7 @@ type, public :: set_diffusivity_CS ; private
 
   !>@{ Diagnostic IDs
   integer :: id_maxTKE     = -1, id_TKE_to_Kd   = -1, id_Kd_user    = -1
-  integer :: id_Kd_layer   = -1, id_Kd_BBL      = -1, id_N2         = -1
+  integer :: id_Kd_BBL      = -1, id_N2         = -1 !id_Kd_layer   = -1, 
   integer :: id_Kd_Work    = -1, id_KT_extra    = -1, id_KS_extra   = -1, id_R_rho = -1
   integer :: id_Kd_bkgnd   = -1, id_Kv_bkgnd    = -1
   !>@}
@@ -177,6 +178,7 @@ type diffusivity_diags
   real, pointer, dimension(:,:,:) :: &
     N2_3d    => NULL(), & !< squared buoyancy frequency at interfaces [T-2 ~> s-2]
     Kd_user  => NULL(), & !< user-added diffusivity at interfaces [Z2 T-1 ~> m2 s-1]
+    !Kd_int_base => NULL(), & !< Diffusivities before adding user-specified diffusivity
     Kd_BBL   => NULL(), & !< BBL diffusivity at interfaces [Z2 T-1 ~> m2 s-1]
     Kd_work  => NULL(), & !< layer integrated work by diapycnal mixing [R Z3 T-3 ~> W m-2]
     maxTKE   => NULL(), & !< energy required to entrain to h_max [Z3 T-3 ~> m3 s-3]
@@ -208,8 +210,8 @@ contains
 !! viscosity associated with processes 1,2 and 4 listed above, which is stored in
 !! visc%Kv_slow. Vertical viscosity due to shear-driven mixing is passed via
 !! visc%Kv_shear
-subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, &
-                           G, GV, US, CS, Kd_lay, Kd_int, Kd_extra_T, Kd_extra_S)
+subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, G, GV, &
+                           US, CS, Kd_lay, Kd_int, Kd_extra_T, Kd_extra_S, T_f, S_f, Kd_int_base)
   type(ocean_grid_type),     intent(in)    :: G    !< The ocean's grid structure.
   type(verticalGrid_type),   intent(in)    :: GV   !< The ocean's vertical grid structure.
   type(unit_scale_type),     intent(in)    :: US   !< A dimensional unit scaling type
@@ -237,6 +239,12 @@ subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, &
   real, dimension(SZI_(G),SZJ_(G),SZK_(G)+1), &
                    optional, intent(out)   :: Kd_int !< Diapycnal diffusivity at each interface [Z2 T-1 ~> m2 s-1].
   real, dimension(SZI_(G),SZJ_(G),SZK_(G)+1), &
+          optional, intent(out)   :: Kd_int_base !< Base case interface diffusivity to be used for tuning [Z2 T-1 ~> m2 s-1].
+!  real, dimension(SZI_(G),SZJ_(G),SZK_(G)+1), &
+!          optional, intent(out)   :: Kd_int_add !< The diapycnal diffusivity added at each interface by the user change diffusivity 
+!                                                    ! call [Z2 T-1 ~> m2 s-1].
+
+  real, dimension(SZI_(G),SZJ_(G),SZK_(G)+1), &
                    optional, intent(out)   :: Kd_extra_T !< The extra diffusivity at interfaces of
                                                      !! temperature due to double diffusion relative to
                                                      !! the diffusivity of density [Z2 T-1 ~> m2 s-1].
@@ -244,16 +252,15 @@ subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, &
                    optional, intent(out)   :: Kd_extra_S !< The extra diffusivity at interfaces of
                                                      !! salinity due to double diffusion relative to
                                                      !! the diffusivity of density [Z2 T-1 ~> m2 s-1].
+  real, dimension(SZI_(G),SZJ_(G),SZK_(G)), & ! Kiera made this an output instead of local
+    optional, intent(out) :: T_f, S_f  ! Temperature and salinity [degC] and [ppt] with properties in massless layers
+                  ! filled vertically by diffusion or the properties after full convective adjustment.
 
   ! local variables
   real, dimension(SZI_(G)) :: &
     N2_bot        ! bottom squared buoyancy frequency [T-2 ~> s-2]
 
   type(diffusivity_diags)  :: dd ! structure with arrays of available diags
-
-  real, dimension(SZI_(G),SZJ_(G),SZK_(G)) :: &
-    T_f, S_f      ! Temperature and salinity [degC] and [ppt] with properties in massless layers
-                  ! filled vertically by diffusion or the properties after full convective adjustment.
 
   real, dimension(SZI_(G),SZK_(G)) :: &
     N2_lay, &     !< Squared buoyancy frequency associated with layers [T-2 ~> s-2]
@@ -283,7 +290,7 @@ subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, &
   integer :: i, j, k, is, ie, js, je, nz, isd, ied, jsd, jed
 
   real      :: kappa_dt_fill ! diffusivity times a timestep used to fill massless layers [Z2 ~> m2]
-
+  
   is  = G%isc ; ie  = G%iec ; js  = G%jsc ; je  = G%jec ; nz = G%ke
   isd = G%isd ; ied = G%ied ; jsd = G%jsd ; jed = G%jed
   showCallTree = callTree_showQuery()
@@ -624,11 +631,15 @@ subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, &
     enddo ; enddo ; endif
   enddo ! j-loop
 
-  if (CS%user_change_diff) then
-    call user_change_diff(h, tv, G, GV, US, CS%user_change_diff_CSp, Kd_lay, Kd_int, &
-                          T_f, S_f, dd%Kd_user)
-  endif
+  ! store Kd_int as Kd_int_base before calling user_change_diff
+  if (present(Kd_int_base)) Kd_int_base(:,:,:) = Kd_int(:,:,:)
+  ! since I'm no longer calling user_change_diff when tuning, I don't really need to add a separate output Kd_int_base.
+  ! Kd_int returned by set_diffusivity is equal to Kd_int_base
 
+  if (CS%user_change_diff) then
+    call user_change_diff(h, tv, G, GV, US, CS%user_change_diff_CSp, Kd_lay, Kd_int, T_f, S_f, dd%Kd_user)
+  endif
+ 
   if (CS%debug) then
     if (present(Kd_lay)) call hchksum(Kd_lay, "Kd_lay", G%HI, haloshift=0, scale=US%Z2_T_to_m2_s)
 
@@ -658,7 +669,7 @@ subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, &
   endif
 
   ! post diagnostics
-  if (present(Kd_lay) .and. (CS%id_Kd_layer > 0)) call post_data(CS%id_Kd_layer, Kd_lay, CS%diag)
+!  if (present(Kd_lay) .and. (CS%id_Kd_layer > 0)) call post_data(CS%id_Kd_layer, Kd_lay, CS%diag)
 
   ! background mixing
   if (CS%id_Kd_bkgnd > 0) call post_data(CS%id_Kd_bkgnd, dd%Kd_bkgnd, CS%diag)
@@ -693,6 +704,8 @@ subroutine set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, optics, visc, dt, &
   if (associated(dd%KS_extra)) deallocate(dd%KS_extra)
   if (associated(dd%drho_rat)) deallocate(dd%drho_rat)
   if (associated(dd%Kd_BBL)) deallocate(dd%Kd_BBL)
+  if (associated(dd%Kd_bkgnd)) deallocate(dd%Kd_bkgnd)
+  if (associated(dd%Kv_bkgnd)) deallocate(dd%Kv_bkgnd)
 
   if (showCallTree) call callTree_leave("set_diffusivity()")
 
@@ -2250,8 +2263,8 @@ subroutine set_diffusivity_init(Time, G, GV, US, param_file, diag, CS, int_tide_
   CS%id_Kv_bkgnd = register_diag_field('ocean_model', 'Kv_bkgnd', diag%axesTi, Time, &
       'Background viscosity added by MOM_bkgnd_mixing module', 'm2/s', conversion=US%Z2_T_to_m2_s)
 
-  CS%id_Kd_layer = register_diag_field('ocean_model', 'Kd_layer', diag%axesTL, Time, &
-      'Diapycnal diffusivity of layers (as set)', 'm2 s-1', conversion=US%Z2_T_to_m2_s)
+!  CS%id_Kd_layer = register_diag_field('ocean_model', 'Kd_layer', diag%axesTL, Time, &
+!      'Diapycnal diffusivity of layers (as set)', 'm2 s-1', conversion=US%Z2_T_to_m2_s)
 
   if (CS%use_tidal_mixing) then
     CS%id_Kd_Work = register_diag_field('ocean_model', 'Kd_Work', diag%axesTL, Time, &

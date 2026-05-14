@@ -70,6 +70,8 @@ use MOM_verticalGrid,        only : verticalGrid_type, get_thickness_units
 use MOM_wave_speed,          only : wave_speeds
 use MOM_wave_interface,      only : wave_parameters_CS
 
+use MOM_diapyc_energy_tuning,   only : diapyc_energy_tuning_init, diapyc_energy_tuning_end
+use MOM_diapyc_energy_tuning,   only : diapyc_energy_tuning_calc, diapyc_energy_tuning_CS
 
 implicit none ; private
 
@@ -165,6 +167,7 @@ type, public:: diabatic_CS; private
   logical :: tracer_tridiag          !< If true, use tracer_vertdiff instead of tridiagTS for
                                      !< vertical diffusion of T and S
   logical :: debug_energy_req        !< If true, test the mixing energy requirement code.
+  logical :: tune_energy_req        !< If true, run the energy tuning code.
   type(diag_ctrl), pointer :: diag   !< structure used to regulate timing of diagnostic output
   real :: MLDdensityDifference       !< Density difference used to determine MLD_user [R ~> kg m-3]
   real :: dz_subML_N2                !< The distance over which to calculate a diagnostic of the
@@ -177,7 +180,7 @@ type, public:: diabatic_CS; private
   integer :: id_wd       = -1, id_ea       = -1, id_eb           = -1 ! used by layer diabatic
   integer :: id_dudt_dia = -1, id_dvdt_dia = -1, id_ea_s         = -1, id_eb_s     = -1
   integer :: id_ea_t     = -1, id_eb_t     = -1
-  integer :: id_Kd_heat  = -1, id_Kd_salt  = -1, id_Kd_interface = -1, id_Kd_ePBL  = -1
+  integer :: id_Kd_heat  = -1, id_Kd_salt  = -1, id_Kd_interface = -1, id_Kd_ePBL  = -1, id_Kd_layer = -1
   integer :: id_Tdif     = -1, id_Tadv     = -1, id_Sdif         = -1, id_Sadv     = -1
   integer :: id_MLD_003  = -1, id_MLD_0125  = -1, id_MLD_user     = -1, id_mlotstsq = -1
   integer :: id_MLD_EN1 = -1, id_MLD_EN2 = -1, id_MLD_EN3= -1
@@ -209,6 +212,13 @@ type, public:: diabatic_CS; private
   integer :: id_frazil_temp_tend    = -1
   integer :: id_frazil_heat_tend    = -1
   integer :: id_frazil_heat_tend_2d = -1
+
+  ! diagnostic IDs for tuning parameters
+!  integer :: id_Kd_int_add = -1
+!  integer :: id_Kd_int_new = -1
+!  integer :: id_Kd_add_tuned = -1
+!  integer :: id_Kd_energy_change_tuned = -1
+!  integer :: id_Kd_energy_Kd_new = -1
   !>@}
 
   logical :: diabatic_diff_tendency_diag = .false. !< If true calculate diffusive tendency diagnostics
@@ -236,6 +246,8 @@ type, public:: diabatic_CS; private
   type(CVMix_conv_cs),          pointer :: CVMix_conv_csp        => NULL() !< Control structure for a child module
   type(diapyc_energy_req_CS),   pointer :: diapyc_en_rec_CSp     => NULL() !< Control structure for a child module
 
+  type(diapyc_energy_tuning_CS), pointer :: diapyc_en_tun_CSp    => NULL() !< Control structure for a child module
+
   type(group_pass_type) :: pass_hold_eb_ea !< For group halo pass
   type(group_pass_type) :: pass_Kv         !< For group halo pass
   type(diag_grid_storage) :: diag_grids_prev!< Stores diagnostic grids at some previous point in the algorithm
@@ -247,6 +259,9 @@ type, public:: diabatic_CS; private
   real, allocatable, dimension(:,:)   :: KPP_salt_flux  !< KPP effective salt flux [ppt m s-1]
 
   type(time_type), pointer :: Time !< Pointer to model time (needed for sponges)
+
+  integer :: tuning_counter = 1 !< Counter for number of timesteps elapsed since last tuning
+
 end type diabatic_CS
 
 !>@{ clock ids
@@ -326,7 +341,7 @@ subroutine diabatic(u, v, h, tv, Hml, fluxes, visc, ADp, CDp, dt, Time_end, &
 
   if (CS%debug_energy_req) &
     call diapyc_energy_req_test(h, dt, tv, G, GV, US, CS%diapyc_en_rec_CSp)
-
+  
   call cpu_clock_begin(id_clock_set_diffusivity)
   call set_BBL_TKE(u, v, h, fluxes, visc, G, GV, US, CS%set_diff_CSp, OBC=OBC)
   call cpu_clock_end(id_clock_set_diffusivity)
@@ -483,7 +498,11 @@ subroutine diabatic_ALE_legacy(u, v, h, tv, Hml, fluxes, visc, ADp, CDp, dt, Tim
     dSV_dS, &    ! The partial derivative of specific volume with salinity [R-1 ppt-1 ~> m3 kg-1 ppt-1].
     cTKE,   &    ! convective TKE requirements for each layer [R Z3 T-2 ~> J m-2].
     u_h,    &    ! zonal and meridional velocities at thickness points after
-    v_h          ! entrainment [L T-1 ~> m s-1]
+    v_h,    &    ! entrainment [L T-1 ~> m s-1]
+  ! below added by Kiera
+    T_f,    &    ! Temperature with massless layers filled in vertically [degC].
+    S_f          ! Salinity with massless layers filled in vertically [ppt].
+
   real, dimension(SZI_(G),SZJ_(G)) :: &
     SkinBuoyFlux! 2d surface buoyancy flux [Z2 T-3 ~> m2 s-3], used by ePBL
   real, dimension(SZI_(G),SZJ_(G),G%ke) :: h_diag      ! diagnostic array for thickness
@@ -496,6 +515,8 @@ subroutine diabatic_ALE_legacy(u, v, h, tv, Hml, fluxes, visc, ADp, CDp, dt, Tim
     ent_t,    & ! The diffusive coupling across interfaces within one time step for
                 ! temperature [H ~> m or kg m-2]
     Kd_int,   & ! diapycnal diffusivity of interfaces [Z2 T-1 ~> m2 s-1]
+!    Kd_int_tuned, &
+    Kd_int_base, &
     Kd_heat,  & ! diapycnal diffusivity of heat [Z2 T-1 ~> m2 s-1]
     Kd_salt,  & ! diapycnal diffusivity of salt and passive tracers [Z2 T-1 ~> m2 s-1]
     Kd_extra_T , & ! The extra diffusivity of temperature due to double diffusion relative to
@@ -590,14 +611,14 @@ subroutine diabatic_ALE_legacy(u, v, h, tv, Hml, fluxes, visc, ADp, CDp, dt, Tim
     call MOM_state_chksum("before set_diffusivity", u, v, h, G, GV, US, haloshift=CS%halo_TS_diff)
   if (CS%double_diffuse) then
     call set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, CS%optics, visc, dt, G, GV, US, CS%set_diff_CSp, &
-                         Kd_int=Kd_int, Kd_extra_T=Kd_extra_T, Kd_extra_S=Kd_extra_S)
+                         Kd_int=Kd_int, Kd_extra_T=Kd_extra_T, Kd_extra_S=Kd_extra_S, &
+                         T_f=T_f,S_f=S_f,Kd_int_base=Kd_int_base)
   else
     call set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, CS%optics, visc, dt, G, GV, US, &
-                         CS%set_diff_CSp, Kd_int=Kd_int)
+                         CS%set_diff_CSp, Kd_int=Kd_int, T_f=T_f, S_f=S_f, Kd_int_base=Kd_int_base)
   endif
   call cpu_clock_end(id_clock_set_diffusivity)
   if (showCallTree) call callTree_waypoint("done with set_diffusivity (diabatic)")
-
 
   if (CS%debug) then
     call MOM_state_chksum("after set_diffusivity ", u, v, h, G, GV, US, haloshift=0)
@@ -1116,7 +1137,7 @@ subroutine diabatic_ALE(u, v, h, tv, Hml, fluxes, visc, ADp, CDp, dt, Time_end, 
     Kd_ePBL,  & ! boundary layer or convective diapycnal diffusivities at interfaces [Z2 T-1 ~> m2 s-1]
     zeros_h,  & ! An array of zeros for h-point diagnostics that should be removed.
     Tdif_flx, & ! diffusive diapycnal heat flux across interfaces [degC H T-1 ~> degC m s-1 or degC kg m-2 s-1]
-    Sdif_flx    ! diffusive diapycnal salt flux across interfaces [ppt H T-1 ~> ppt m s-1 or ppt kg m-2 s-1]
+    Sdif_flx   ! diffusive diapycnal salt flux across interfaces [ppt H T-1 ~> ppt m s-1 or ppt kg m-2 s-1]
   real, dimension(SZIB_(G),SZJ_(G),SZK_(G)) :: &
     zeros_u     ! An array of zeros for u-point diagnostics that should be removed.
   real, dimension(SZI_(G),SZJB_(G),SZK_(G)) :: &
@@ -1603,6 +1624,8 @@ subroutine layered_diabatic(u, v, h, tv, Hml, fluxes, visc, ADp, CDp, dt, Time_e
     eb,     &    ! amount of fluid entrained from the layer below within
                  ! one time step  [H ~> m or kg m-2]
     Kd_lay, &    ! diapycnal diffusivity of layers [Z2 T-1 ~> m2 s-1]
+    Kd_lay_tuned, &
+    Kd_lay_base, &
     h_orig, &    ! initial layer thicknesses [H ~> m or kg m-2]
     h_prebound, & ! initial layer thicknesses [H ~> m or kg m-2]
     hold,   &    ! layer thickness before diapycnal entrainment, and later
@@ -1611,7 +1634,10 @@ subroutine layered_diabatic(u, v, h, tv, Hml, fluxes, visc, ADp, CDp, dt, Time_e
     dSV_dT, &    ! The partial derivative of specific volume with temperature [R-1 degC-1 ~> m3 kg-1 degC-1]
     dSV_dS, &    ! The partial derivative of specific volume with salinity [R-1 ppt-1 ~> m3 kg-1 ppt-1].
     u_h,    &    ! zonal and meridional velocities at thickness points after
-    v_h          ! entrainment [L T-1 ~> m s-1]
+    v_h,    &    ! entrainment [L T-1 ~> m s-1]
+  ! below added by Kiera
+    T_f,    &    ! Temperature with massless layers filled in vertically [degC].
+    S_f          ! Salinity with massless layers filled in vertically [ppt].
   real, dimension(SZI_(G),SZJ_(G)) :: &
     Rcv_ml, &   ! coordinate density of mixed layer, used for applying sponges
     SkinBuoyFlux! 2d surface buoyancy flux [Z2 T-3 ~> m2 s-3], used by ePBL
@@ -1628,6 +1654,8 @@ subroutine layered_diabatic(u, v, h, tv, Hml, fluxes, visc, ADp, CDp, dt, Time_e
 
   real, dimension(SZI_(G),SZJ_(G),SZK_(G)+1) :: &
     Kd_int,   & ! diapycnal diffusivity of interfaces [Z2 T-1 ~> m2 s-1]
+    Kd_int_tuned, &
+    Kd_int_base, &
     Kd_heat,  & ! diapycnal diffusivity of heat [Z2 T-1 ~> m2 s-1]
     Kd_salt,  & ! diapycnal diffusivity of salt and passive tracers [Z2 T-1 ~> m2 s-1]
     Kd_extra_T , & ! The extra diffusivity of temperature due to double diffusion relative to
@@ -1688,6 +1716,21 @@ subroutine layered_diabatic(u, v, h, tv, Hml, fluxes, visc, ADp, CDp, dt, Time_e
   logical :: showCallTree ! If true, show the call tree
   integer, dimension(2) :: EOSdom ! The i-computational domain for the equation of state
   integer :: i, j, k, is, ie, js, je, Isq, Ieq, Jsq, Jeq, nz, nkmb, m, halo
+
+  character(len=300)  ::  output_str
+
+!  write (output_str, '(A, I5, A, I5, A, I5, A)') "From layered_diabatic, tv%T dimensions: (", &
+!          size(tv%T, dim=1), ",", size(tv%T, dim=2), ",", size(tv%T, dim=3), ")"
+!  call MOM_mesg(''//output_str)
+!  write (output_str, '(A, I5, A, I5, A, I5, A)') "From layered_diabatic, h array dimensions: (", &
+!          size(hold, dim=1), ",", size(hold, dim=2), ",", size(hold, dim=3), ")"
+!  call MOM_mesg(''//output_str)
+!  write (output_str, '(A, I5, A, I5, A, I5, A)') "From layered_diabatic, Kd_int dimensions: (", &
+!          size(Kd_int, dim=1), ",", size(Kd_int, dim=2), ",", size(Kd_int, dim=3), ")"
+!  call MOM_mesg(''//output_str)
+!  write (output_str, '(A, I5, A, I5, A)') "From layered_diabatic, energy_Kd_tuned dimensions: (", &
+!          size(energy_Kd_tuned, dim=1), ",", size(energy_Kd_tuned, dim=2), ")"
+!  call MOM_mesg(''//output_str)
 
   is   = G%isc  ; ie  = G%iec  ; js  = G%jsc  ; je  = G%jec ; nz = G%ke
   Isq  = G%IscB ; Ieq = G%IecB ; Jsq = G%JscB ; Jeq = G%JecB
@@ -1750,6 +1793,7 @@ subroutine layered_diabatic(u, v, h, tv, Hml, fluxes, visc, ADp, CDp, dt, Time_e
         call bulkmixedlayer(h, u_h, v_h, tv, fluxes, dt*CS%ML_mix_first, &
                             eaml,ebml, G, GV, US, CS%bulkmixedlayer_CSp, CS%optics, &
                             Hml, CS%aggregate_FW_forcing, dt, last_call=.false.)
+      else
         ! Changes: h, tv%T, tv%S, eaml and ebml  (G is also inout???)
         call bulkmixedlayer(h, u_h, v_h, tv, fluxes, dt, eaml, ebml, &
                             G, GV, US, CS%bulkmixedlayer_CSp, CS%optics, &
@@ -1801,13 +1845,27 @@ subroutine layered_diabatic(u, v, h, tv, Hml, fluxes, visc, ADp, CDp, dt, Time_e
     call MOM_state_chksum("before set_diffusivity", u, v, h, G, GV, US, haloshift=CS%halo_TS_diff)
   if (CS%double_diffuse) then
     call set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, CS%optics, visc, dt, G, GV, US, CS%set_diff_CSp, &
-                         Kd_lay=Kd_lay, Kd_int=Kd_int, Kd_extra_T=Kd_extra_T, Kd_extra_S=Kd_extra_S)
+                         Kd_lay=Kd_lay, Kd_int=Kd_int, Kd_extra_T=Kd_extra_T, Kd_extra_S=Kd_extra_S, & 
+                         T_f=T_f, S_f=S_f)
   else
-    call set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, CS%optics, visc, dt, G, GV, US, &
-                         CS%set_diff_CSp, Kd_lay=Kd_lay, Kd_int=Kd_int)
+    call set_diffusivity(u, v, h, u_h, v_h, tv, fluxes, CS%optics, visc, dt, G, GV, US, CS%set_diff_CSp, &
+                         Kd_lay=Kd_lay, Kd_int=Kd_int, T_f=T_f, S_f=S_f)
   endif
   call cpu_clock_end(id_clock_set_diffusivity)
   if (showCallTree) call callTree_waypoint("done with set_diffusivity (diabatic)")
+
+  Kd_int_base = Kd_int
+  Kd_lay_base = Kd_lay
+
+  if (CS%tune_energy_req) then
+    call diapyc_energy_tuning_calc(h, dt, tv, G, GV, US, CS%diapyc_en_tun_CSp, T_f, S_f, Kd_int, Kd_int_base, Kd_int_tuned, &
+      Kd_lay, Kd_lay_base, Kd_lay_tuned)
+!    if (associated(CS%tracer_flow_control_CSp)) then
+!      if (associated(CS%tracer_flow_control_CSp%enhanced_Kd_temp_tracer_CSp)) then
+!        CS%tracer_flow_control_CSp%enhanced_Kd_temp_tracer_CSp%Kd_int_tuned = Kd_int_tuned
+!      end if
+!    end if
+  endif
 
   if (CS%debug) then
     call MOM_state_chksum("after set_diffusivity ", u, v, h, G, GV, US, haloshift=0)
@@ -1944,6 +2002,8 @@ subroutine layered_diabatic(u, v, h, tv, Hml, fluxes, visc, ADp, CDp, dt, Time_e
   ! for diapycnal diffusion and advection.  Sets: ea, eb. Changes: kb
   call Entrainment_diffusive(h, tv, fluxes, dt, G, GV, US, CS%entrain_diffusive_CSp, &
                              ea, eb, kb, Kd_lay=Kd_lay, Kd_int=Kd_int)
+! call Entrainment_diffusive(h, tv, fluxes, dt, G, GV, US, CS%entrain_diffusive_CSp, &
+!                             ea, eb, kb, Kd_int=Kd_int)
   call cpu_clock_end(id_clock_entrain)
   if (showCallTree) call callTree_waypoint("done with Entrainment_diffusive (diabatic)")
 
@@ -2487,6 +2547,7 @@ subroutine layered_diabatic(u, v, h, tv, Hml, fluxes, visc, ADp, CDp, dt, Time_e
 
   ! Diagnose the diapycnal diffusivities and other related quantities.
   if (CS%id_Kd_interface > 0) call post_data(CS%id_Kd_interface, Kd_int,  CS%diag)
+  if (CS%id_Kd_layer     > 0) call post_data(CS%id_Kd_layer,     Kd_lay,  CS%diag)
   if (CS%id_Kd_heat      > 0) call post_data(CS%id_Kd_heat,      Kd_heat, CS%diag)
   if (CS%id_Kd_salt      > 0) call post_data(CS%id_Kd_salt,      Kd_salt, CS%diag)
   if (CS%id_Kd_ePBL      > 0) zeros_h(:,:,:) = 0.0
@@ -3000,6 +3061,9 @@ subroutine diabatic_driver_init(Time, G, GV, US, param_file, useALEalgorithm, di
 
   call get_param(param_file, mdl, "DEBUG_ENERGY_REQ", CS%debug_energy_req, &
                  "If true, debug the energy requirements.", default=.false., do_not_log=.true.)
+  call get_param(param_file, mdl, "TUNE_DIFFUSIVITY", CS%tune_energy_req, &
+                 "If true, tune the energy requirements of added diffusivity.", default=.false., do_not_log=.true.)
+
   call get_param(param_file, mdl, "MIX_BOUNDARY_TRACERS", CS%mix_boundary_tracers, &
                  "If true, mix the passive tracers in massless layers at "//&
                  "the bottom into the interior as though a diffusivity of "//&
@@ -3182,7 +3246,9 @@ subroutine diabatic_driver_init(Time, G, GV, US, param_file, useALEalgorithm, di
   !call set_diffusivity_init(Time, G, param_file, diag, CS%set_diff_CSp, CS%int_tide_CSp)
   CS%id_Kd_interface = register_diag_field('ocean_model', 'Kd_interface', diag%axesTi, Time, &
       'Total diapycnal diffusivity at interfaces', 'm2 s-1', conversion=US%Z2_T_to_m2_s)
-  if (CS%use_energetic_PBL) then
+  CS%id_Kd_layer = register_diag_field('ocean_model', 'Kd_layer', diag%axesTL, Time, &
+      'Total diapycnal diffusivity of layers', 'm2 s-1', conversion=US%Z2_T_to_m2_s)
+ if (CS%use_energetic_PBL) then
       CS%id_Kd_ePBL = register_diag_field('ocean_model', 'Kd_ePBL', diag%axesTi, Time, &
           'ePBL diapycnal diffusivity at interfaces', 'm2 s-1', conversion=US%Z2_T_to_m2_s)
   endif
@@ -3440,7 +3506,10 @@ subroutine diabatic_driver_init(Time, G, GV, US, param_file, useALEalgorithm, di
 
   if (CS%debug_energy_req) &
     call diapyc_energy_req_init(Time, G, GV, US, param_file, diag, CS%diapyc_en_rec_CSp)
-
+  
+  if (CS%tune_energy_req) &
+    call diapyc_energy_tuning_init(Time, G, GV, US, param_file, diag, CS%diapyc_en_tun_CSp)
+  
   ! obtain information about the number of bands for penetrative shortwave
   if (use_temperature) then
     call get_param(param_file, mdl, "PEN_SW_NBANDS", nbands, default=1)
@@ -3482,6 +3551,9 @@ subroutine diabatic_driver_end(CS)
     call energetic_PBL_end(CS%energetic_PBL_CSp)
   if (CS%debug_energy_req) &
     call diapyc_energy_req_end(CS%diapyc_en_rec_CSp)
+
+  if (CS%tune_energy_req) & 
+    call diapyc_energy_tuning_end(CS%diapyc_en_tun_CSp)
 
   if (associated(CS%optics)) then
     call opacity_end(CS%opacity_CSp, CS%optics)

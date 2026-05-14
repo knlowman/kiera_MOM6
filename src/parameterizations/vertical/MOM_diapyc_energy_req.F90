@@ -263,8 +263,9 @@ subroutine diapyc_energy_req_calc(h_in, T_in, S_in, Kd, energy_Kd, dt, tv, &
   nz = G%ke
   h_neglect = GV%H_subroundoff
 
-  debug = .true.
+  debug = .false. ! set to false
 
+  ! only the PE_chg_k values from surface_BL are being used to calculate energy_Kd
   surface_BL = .true. ; bottom_BL = .true. ; halves = .true.
   central = .true. ; K_cent = nz/2
 

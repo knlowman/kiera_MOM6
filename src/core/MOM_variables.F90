@@ -122,6 +122,7 @@ type, public :: thermo_var_ptrs
   real, pointer :: varS(:,:,:) => NULL() !< SGS variance of salinity [ppt2].
   real, pointer :: covarTS(:,:,:) => NULL() !< SGS covariance of salinity and potential
                                   !! temperature [degC ppt].
+  real, pointer :: Kd_int_tuned(:,:,:) => NULL() !< Added Kd. Used with enhanced_Kd_temp_tracer 
 end type thermo_var_ptrs
 
 !> Pointers to all of the prognostic variables allocated in MOM_variables.F90 and MOM.F90.
